@@ -14,7 +14,7 @@ from data_io_hdf5 import save_dict_to_hdf5, load_dict_from_hdf5, save_array_to_h
 import matplotlib.pyplot as plt
 import cv2
 from cv2 import VideoWriter, VideoWriter_fourcc
-
+import skimage
 
 '''
 This module creates the visual stimuli. Stimuli include patches of sinusoidal gratings at different orientations
@@ -74,6 +74,8 @@ class VideoBaseClass:
 		options["image_width_in_deg"] = options["image_width"] / options["pix_per_deg"]
 
 		self.options=options
+
+
 
 	def get_xrange_deg(self):
 		stimulus_center_x = self.options['stimulus_position'][0]
@@ -274,7 +276,7 @@ class StimulusPattern:
 		
 	def natural_video(self, full_path, width, height, fps, duration, spatial_band_pass=None, temporal_band_pass=None, orientation=0):
 		pass
-		
+
 	def phase_scrambled_video(self, full_path, width, height, fps, duration, spatial_band_pass=None, temporal_band_pass=None, orientation=0):
 		pass
 
@@ -329,7 +331,7 @@ class ConstructStimulus(VideoBaseClass):
 	Create stimulus video and save
 	'''
 
-	def __init__(self, **kwargs):
+	def __init__(self, video_center_pc=0+0j, **kwargs):
 		'''
 		Format: my_video_object.main(filename, keyword1=value1, keyword2=value2,...)
 		
@@ -391,6 +393,26 @@ class ConstructStimulus(VideoBaseClass):
 		eval(f'StimulusForm.{self.options["stimulus_form"]}(self)') # Direct call to class.method() requires the self argument
 
 		self._scale_intensity()
+
+		self.video = self.frames.transpose(2, 0, 1)
+		self.fps = self.options['fps']
+		self.pix_per_deg = self.options['pix_per_deg']
+
+		self.video_n_frames = len(self.video)
+		self.video_width = self.video[0].shape[1]
+		self.video_height = self.video[1].shape[0]
+		self.video_width_deg = self.video_width / self.pix_per_deg
+		self.video_height_deg = self.video_height / self.pix_per_deg
+
+		self.video_xmin_deg = video_center_pc.real - self.video_width_deg / 2
+		self.video_xmax_deg = video_center_pc.real + self.video_width_deg / 2
+		self.video_ymin_deg = video_center_pc.imag - self.video_height_deg / 2
+		self.video_ymax_deg = video_center_pc.imag + self.video_height_deg / 2
+
+	def get_2d_video(self):
+		stim_video_2d = np.reshape(self.video, (self.video_n_frames,
+												self.video_height * self.video_width)).T  # pixels as rows, time as cols
+		return stim_video_2d
 
 	def save_to_file(self, filename):
 		self._write_frames_to_videofile(filename)
