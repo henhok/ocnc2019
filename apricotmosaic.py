@@ -8,7 +8,10 @@ from scipy.signal import fftconvolve as fftconv
 import skimage
 from scipy.interpolate import interp1d
 import scipy.optimize as opt
+from scipy.integrate import quad, trapz
 import visual_stimuli as vs
+import pathos.multiprocessing as mp
+from tqdm import *
 
 plt.rcParams['image.cmap'] = 'gray'
 
@@ -29,7 +32,7 @@ class ParasolMosaic(object):
         self.data = raw_data['mosaicGLM'][0]
 
         self.n_cells = len(self.data)
-        print('Loaded data with %d cells' % self.n_cells)
+        print('Loaded RGC data file %s with %d cells' % (ParasolMosaic.on_parasol_datafile, self.n_cells))
 
         self.rgc_spatial_params = pd.DataFrame(columns=['center_x', 'center_y', 'sd_x', 'sd_y', 'center_rot'])
         self.tonicdrive = np.zeros((self.n_cells, 1))
@@ -38,6 +41,8 @@ class ParasolMosaic(object):
 
         self.extract_data_spatial_params()
         self.extract_data_filter_components()
+
+        self.stim_video = None
 
     def extract_data_spatial_params(self):
 
@@ -283,8 +288,12 @@ class ParasolMosaic(object):
     #
     #     return dog_filter
 
-    def feed_stimulus(self, stim_video, cellnum, nonlinearity=np.exp):
+    def load_stimulus(self, stim_video):
+        self.stim_video = stim_video
 
+    def feed_stimulus(self, cellnum):
+
+        stim_video = self.stim_video
         # Get spatial filter parameters
         fitted_spatial_params = self.create_spatiotemporal_filter(cellnum)
         # amplitudec, xoc, yoc, semi_xc, semi_yc, orientation_center, amplitudes,sur_ratio, offset
@@ -317,17 +326,114 @@ class ParasolMosaic(object):
         spatiotemporal_kernel = (original_filter_integral/fitted_filter_integral) * spatiotemporal_kernel
 
         # Deal with video
-        stim_video_2d = stim_video.get_2d_video()
+        # We assume videos are grayscale with int 0-255 which we shift to range [-0.5, 0.5]
+        stim_video_2d = (stim_video.get_2d_video() / 255) - 0.5
+        print('Stimulus values have been scaled between %f and %f' % (np.min(stim_video_2d), np.max(stim_video_2d)))
+
         filtered_stim = fftconv(stim_video_2d, spatiotemporal_kernel, mode='valid')
 
-        return nonlinearity(filtered_stim.ravel()/255) + self.tonicdrive[cellnum]
+        return filtered_stim.ravel()
 
+
+    def spiking(self, cellnum, nonlinearity=np.exp):
+
+        stim_video = self.stim_video
+
+        # Sim settings
+        RefreshRate = 120
+        DTsim = 0.01
+        nbinsPerEval = 100  # corresponds to 0.01*100 / 120 sec = 1/120 sec
+
+        # Run stimulus thru the spatiotemporal filter
+        convolved_stimulus = self.feed_stimulus(cellnum) + self.tonicdrive[cellnum]
+        slen = len(convolved_stimulus)
+        Vmem_func = interp1d(range(slen), convolved_stimulus, 'linear')
+        rlen = int((slen-1) / DTsim)
+        Vmem = Vmem_func(np.arange(0, slen-1, DTsim))
+
+        # Get postspike filter h
+        ip_postspike_filter_func = self.interpolate_postspike_filter(video_fps=120, cellnum=cellnum, ip_kind='linear')
+        postspike_rlen = int((ParasolMosaic.tsteps_postspike_filter-1) / DTsim)
+        ip_postspike_filter = ip_postspike_filter_func(np.arange(0, ParasolMosaic.tsteps_postspike_filter-1, DTsim))
+
+        # Actual spiking loop
+        jbin = 0
+        n_spikes = 0
+        rprev = 0
+        tspnext = np.random.exponential()
+        tsp = []
+
+        while jbin < rlen:
+            iinxt = np.arange(jbin, min(jbin+nbinsPerEval, rlen), 1)
+            rrnxt = nonlinearity(Vmem[iinxt])*DTsim/RefreshRate
+            rrcum = np.cumsum(rrnxt)+rprev
+
+            if(tspnext >= rrcum[-1]):  # No spike
+                jbin = iinxt[-1] + 1
+                rprev = rrcum[-1]
+
+            else:  # Spike!
+                ispk = jbin + np.min(np.where(rrcum >= tspnext))
+                n_spikes += 1
+                tsp.append(ispk*DTsim)
+                print(tsp[-1])
+
+                # Inject postspike current
+                mxi = np.min([rlen, ispk+postspike_rlen])
+                ii_postspike = np.arange(ispk+1, mxi, 1)
+                Vmem[ii_postspike] = Vmem[ii_postspike] + ip_postspike_filter[0:mxi - ispk -1]
+
+                # Draw next spike time etc
+                tspnext = np.random.exponential()
+                rprev = 0
+                jbin = ispk + 1
+
+
+        return tsp, Vmem
+        # jbin = 1; % current time bin
+        # nsp = 0; % number of spikes
+        # tspnext = exprnd(1);  % time of next spike (in rescaled time)
+        # rprev = 0;  % Integrated rescaled time up to current point
+        # while jbin <= rlen
+        #     iinxt = jbin:min(jbin+nbinsPerEval-1,rlen);
+        #     rrnxt = nlfun(Vmem(iinxt))*dt/RefreshRate; % Cond Intensity
+        #     rrcum = cumsum(rrnxt)+rprev; % integrated cond intensity
+        #     if (tspnext >= rrcum(end)) % No spike in this window
+        #         jbin = iinxt(end)+1;
+        #         rprev = rrcum(end);
+        #     else   % Spike!
+        #         ispk = iinxt(min(find(rrcum>=tspnext))); % time bin where spike occurred
+        #         nsp = nsp+1;
+        #         tsp(nsp) = ispk*dt; % spike time
+        #         mxi = min(rlen, ispk+hlen); % max time affected by post-spike kernel
+        #         iiPostSpk = ispk+1:mxi; % time bins affected by post-spike kernel
+        #         if ~isempty(iiPostSpk)
+        #             Vmem(iiPostSpk) = Vmem(iiPostSpk)+ihhi(1:mxi-ispk);
+        #             if nargout == 3  % Record post-spike current
+        #                 Ispk(iiPostSpk) = Ispk(iiPostSpk)+ihhi(1:mxi-ispk);
+        #             end
+        #         end
+        #         tspnext = exprnd(1);  % draw next spike time
+        #         rprev = 0; % reset integrated intensity
+        #         jbin = ispk+1;  % Move to next bin
+        #         % --  Update # of samples per iter ---
+        #         muISI = jbin/nsp;
+        #         nbinsPerEval = max(20, round(1.5*muISI));
+        #     end
+        # end
+        # tsp = tsp(1:nsp); % prune extra zeros
 
 class SimpleVideo(object):
 
-    def __init__(self, video_path_and_pattern, fps=25, pix_per_deg=4.5, video_center_pc=0+0j):  # defaults from catcam dataset
+    def __init__(self, video_path, video_type='tiff_folder', fps=120, pix_per_deg=4.5, video_center_pc=0 + 0j):  # defaults from catcam dataset
 
-        self.video = skimage.io.ImageCollection(video_path_and_pattern)
+        if video_type == 'tiff_folder':
+            self.video = skimage.io.ImageCollection(video_path)  # We assume video to be in the form (frames, video_height, video_width)
+        if video_type == 'matlab':
+            self.video = sio.loadmat(video_path, squeeze_me=True)['Stim']
+
+        print('Loaded %s file with shape %s' % (video_type, str(np.shape(self.video))))
+
         self.fps = fps
         self.pix_per_deg = pix_per_deg
         self.deg_to_px = lambda x: (x * self.pix_per_deg) // 1
@@ -354,15 +460,68 @@ class SimpleVideo(object):
                                                 self.video_height*self.video_width)).T  # pixels as rows, time as cols
         return stim_video_2d
 
-
-
 if __name__ == '__main__':
 
     mosaic = ParasolMosaic()
-    a = SimpleVideo('./movie01/Catt0*.tif', video_center_pc=35+15j)
-    convcat = mosaic.feed_stimulus(a, 5)
-    plt.plot(range(len(convcat)), convcat)
+    # a = SimpleVideo('./movie01/Catt0*.tif', video_center_pc=35+15j)
+
+
+    # fig,ax = plt.subplots(1,1)
+    # mosaic.plot_mosaic(ax=ax)
+    # plt.show()
+
+    a = vs.ConstructStimulus(video_center_pc=32 + 27.9j, pattern='sine_grating', temporal_frequency=3,
+                                       duration_seconds=1, fps=120, orientation=45, image_width=320, image_height=240, pix_per_deg=4.5)
+    # a = SimpleVideo('Stim.mat', video_type='matlab', video_center_pc=35+15j, pix_per_deg=2.5)
+    mosaic.load_stimulus(a)
+
+
+    # Parallel solution runs out of memory... :(
+    # pool = mp.ProcessingPool(processes=3)
+    #
+    # results = []
+    #
+    # with tqdm(total=len(cells), desc='Watching video') as progress:
+    #     for res in pool.imap(mosaic.spiking, cells):
+    #         results.append(res)
+    #         progress.update()
+    #
+    # progress.close()
+    # pool.close()
+    # pool.join()
+    #
+    # print (results)
+
+    n_trials = 20
+    events = []
+    fig, ax = plt.subplots(2, 1)
+
+    for trial in range(n_trials):
+        b,Vmem = mosaic.spiking(64)
+        b = np.array(b) * (1/120)
+        events.append(b)
+        ax[0].plot(range(len(Vmem)), Vmem)
+
+    ax[1].eventplot(events)
     plt.show()
+
+    # cells = [1,3,5]
+    # events = []
+    # fig, ax = plt.subplots(2,1)
+    #
+    # for cellnum in cells:
+    #     b, Vmem = mosaic.spiking(cellnum)
+    #     events.append(b)
+    #     ax[0].plot(range(len(Vmem)), np.exp(Vmem))
+    #
+    # ax[1].eventplot(events)
+    # plt.show()
+
+
+    #convcat = mosaic.feed_stimulus(a, 5)
+
+    #plt.plot(range(len(convcat)), convcat)
+    #plt.show()
 
 
     # video_grating = vs.ConstructStimulus(video_center_pc=35+15j, pattern='sine_grating', temporal_frequency=8, duration_seconds=2, fps=120,
